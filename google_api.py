@@ -70,12 +70,12 @@ def get_contacts_api_call(service, page_token):
     )
 
 
-def fetch_contacts(service, label_resource_name, backoff=2, max_retries=6):
+def fetch_contacts(service, label_resource_name, initial_backoff=2, max_retries=6):
     print("Fetching contacts", end="")
     contacts = []
     page_token = None
     retries = 0
-    backoff_time = backoff
+    backoff_time = initial_backoff
     while True:
         try:
             result = get_contacts_api_call(service, page_token)
@@ -96,7 +96,7 @@ def fetch_contacts(service, label_resource_name, backoff=2, max_retries=6):
             print(".", end="", flush=True)
             if not page_token:
                 break
-            backoff_time = backoff
+            backoff_time = initial_backoff
         except HttpError as error:
             if error.resp.status in (503, 429) and retries < max_retries:
                 print(f"Error {error.resp.status}.")
@@ -116,14 +116,18 @@ def delete_contact_api_call(service, contact_resource_name):
     service.people().deleteContact(resourceName=contact_resource_name).execute()
 
 
-def delete_contacts(service, contacts, backoff=2, max_retries=6):
+def delete_contacts(service, contacts, initial_backoff=2, max_retries=6):
     print("Deleting contacts...")
-    backoff_time = backoff
-    for contact in contacts:
+    total_contacts = len(contacts)
+    backoff_time = initial_backoff
+    for index, contact in enumerate(contacts):
         retries = 0
         while True:
             try:
-                print(f"Deleting contact: {contact['resourceName']}")
+                print(
+                    f"Deleting {index + 1} of {total_contacts}: {contact['resourceName']}"
+                )
+
                 delete_contact_api_call(service, contact["resourceName"])
                 break
             except HttpError as error:
@@ -136,5 +140,5 @@ def delete_contacts(service, contacts, backoff=2, max_retries=6):
                 else:
                     print(f"\nAn error occurred: {error}")
                     break
-        backoff_time = backoff
+        backoff_time = initial_backoff
     print("Deletion completed")
