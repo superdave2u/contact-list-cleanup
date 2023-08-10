@@ -13,6 +13,7 @@ from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from filters import record_filters
+from utils import rate_limited_calls_per_min
 
 SCOPES = ["https://www.googleapis.com/auth/contacts"]
 
@@ -39,25 +40,30 @@ def get_label_id(service, label_name):
     return label_resource_name
 
 
-def fetch_contacts(service, label_resource_name, max_retries=5):
+@rate_limited_calls_per_min(90)
+def get_contacts_api_call(service, page_token):
+    return (
+        service.people()
+        .connections()
+        .list(
+            resourceName="people/me",
+            pageSize=2000,
+            pageToken=page_token,
+            requestMask_includeField="person.names,person.phoneNumbers,person.memberships",
+        )
+        .execute()
+    )
+
+
+def fetch_contacts(service, label_resource_name, backoff=2, max_retries=6):
     print("Fetching contacts", end="")
     contacts = []
     page_token = None
     retries = 0
-    backoff_time = 1
+    backoff_time = backoff
     while True:
         try:
-            result = (
-                service.people()
-                .connections()
-                .list(
-                    resourceName="people/me",
-                    pageSize=2000,
-                    pageToken=page_token,
-                    requestMask_includeField="person.names,person.phoneNumbers,person.memberships",
-                )
-                .execute()
-            )
+            result = get_contacts_api_call(service, page_token)
             connections = result.get("connections", [])
             label_filtered_connections = [
                 connection
@@ -75,17 +81,14 @@ def fetch_contacts(service, label_resource_name, max_retries=5):
             print(".", end="", flush=True)
             if not page_token:
                 break
-            backoff_time = 1  # Resetting backoff time
+            backoff_time = backoff
         except HttpError as error:
-            if (
-                error.resp.status in (503, 429) and retries < max_retries
-            ):  # Service Unavailable or Rate Limiting
-                print(
-                    f"\nError {error.resp.status}. Retrying in {backoff_time} seconds..."
-                )
+            if error.resp.status in (503, 429) and retries < max_retries:
+                print(f"Error {error.resp.status}.")
+                print(f"  Retrying in {backoff_time} seconds...")
                 time.sleep(backoff_time)
                 retries += 1
-                backoff_time *= 2  # Increasing backoff time for each retry
+                backoff_time *= 2
             else:
                 print(f"\nAn error occurred: {error}")
                 return None
@@ -100,10 +103,8 @@ def filter_contacts(contacts):
     for contact in contacts:
         result = record_filters().handle(contact)
         if result:
-            # Skip the contact
             skipped_contacts.append(contact)
         else:
-            # Add to the deletion list
             to_delete_contacts.append(contact)
         print(".", end="", flush=True)
     print(".")
@@ -139,6 +140,11 @@ def save_to_files(skipped_contacts, to_delete_contacts):
             writer.writerow([formatted_numbers, name, "To delete"])
 
 
+@rate_limited_calls_per_min(90)
+def delete_contact_api_call(service, contact_resource_name):
+    service.people().deleteContact(resourceName=contact_resource_name).execute()
+
+
 def delete_contacts(service, contacts, backoff=2, max_retries=6):
     print("Deleting contacts...")
     backoff_time = backoff
@@ -147,23 +153,17 @@ def delete_contacts(service, contacts, backoff=2, max_retries=6):
         while True:
             try:
                 print(f"Deleting contact: {contact['resourceName']}")
-                service.people().deleteContact(
-                    resourceName=contact["resourceName"]
-                ).execute()
-                break  # If successful, move on to the next contact
+                delete_contact_api_call(service, contact["resourceName"])
+                break
             except HttpError as error:
-                if (
-                    error.resp.status in (429, 503) and retries < max_retries
-                ):  # Rate Limiting or Service Unavailable
-                    print(
-                        f"\nError {error.resp.status}. Retrying in {backoff_time} seconds..."
-                    )
+                if error.resp.status in (429, 503) and retries < max_retries:
+                    print(f"Error {error.resp.status}.")
+                    print(f"  Retrying in {backoff_time} seconds...")
                     time.sleep(backoff_time)
                     retries += 1
-                    backoff_time *= 2  # Increasing backoff time for each retry
+                    backoff_time *= 2
                 else:
                     print(f"\nAn error occurred: {error}")
-                    # Handle other errors as needed, perhaps by skipping to the next contact
                     break
         backoff_time = backoff
     print("Deletion completed")
@@ -172,14 +172,12 @@ def delete_contacts(service, contacts, backoff=2, max_retries=6):
 def init():
     parser = argparse.ArgumentParser(description="Supply a label to filter contacts.")
     parser.add_argument("--label", type=str, help="Label to filter contacts")
-
     args = parser.parse_args()
     label = args.label
-
     if label:
         return label
     else:
-        print("No label provided")
+        quit("No label provided")
 
 
 def auth():
